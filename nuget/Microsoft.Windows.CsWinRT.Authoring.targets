@@ -16,6 +16,11 @@ Copyright (C) Microsoft Corporation. All rights reserved.
     <CsWinRTEnableLogging>$(CsWinRTEnableLogging)</CsWinRTEnableLogging>
   </PropertyGroup>
 
+  <!-- Let WinRT.Host know the project is self-contained. -->
+  <ItemGroup Condition="'$(SelfContained)' == 'true' or '$(PublishSelfContained)' == 'true'">
+    <RuntimeHostConfigurationOption Include="CSWINRT_SELF_CONTAINED" Value="true" />
+  </ItemGroup>
+
   <PropertyGroup>
     <CsWinRTAuthoring_Platform Condition="'$(Platform)'=='AnyCPU'">x86</CsWinRTAuthoring_Platform>
     <CsWinRTAuthoring_Platform Condition="'$(Platform)'!='AnyCPU'">$(Platform)</CsWinRTAuthoring_Platform>

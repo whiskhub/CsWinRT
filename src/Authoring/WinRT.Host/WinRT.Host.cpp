@@ -43,6 +43,7 @@ typedef int (CORECLR_DELEGATE_CALLTYPE* get_activation_factory_fn)(
 static get_activation_factory_fn get_activation_factory = nullptr;
 static hostfxr_close_fn hostfxr_close = nullptr;
 static hostfxr_get_runtime_delegate_fn hostfxr_get_runtime_delegate = nullptr;
+static hostfxr_initialize_for_dotnet_command_line_fn hostfxr_initialize_for_dotnet_command_line = nullptr;
 static hostfxr_initialize_for_runtime_config_fn hostfxr_initialize_for_runtime_config = nullptr;
 static hostfxr_set_error_writer_fn hostfxr_set_error_writer = nullptr;
 static load_assembly_and_get_function_pointer_fn load_assembly_and_get_function_pointer = nullptr;
@@ -143,11 +144,12 @@ inline void check_hostfxr_hresult(hresult const result)
 }
 
 // Using the nethost library, discover the location of hostfxr and get exports
-void load_hostfxr()
+void load_hostfxr(const char_t* assembly_path)
 {
     static const auto is_hostfxr_loaded = [&]()
     {
         return(hostfxr_initialize_for_runtime_config &&
+            hostfxr_initialize_for_dotnet_command_line &&
             hostfxr_get_runtime_delegate &&
             hostfxr_close &&
             hostfxr_set_error_writer);
@@ -160,7 +162,11 @@ void load_hostfxr()
 
     wchar_t buffer[MAX_PATH];
     size_t buffer_size = sizeof(buffer) / sizeof(wchar_t);
-    check_hostfxr_hresult(get_hostfxr_path(buffer, &buffer_size, nullptr));
+    struct get_hostfxr_parameters params;
+    params.size = sizeof(params);
+    params.assembly_path = assembly_path;
+    params.dotnet_root = nullptr;
+    check_hostfxr_hresult(get_hostfxr_path(buffer, &buffer_size, &params));
     auto lib = ::LoadLibraryW(buffer);
     if (lib == 0)
     {
@@ -168,6 +174,7 @@ void load_hostfxr()
     }
 
     if ((hostfxr_initialize_for_runtime_config = (hostfxr_initialize_for_runtime_config_fn)::GetProcAddress(lib, "hostfxr_initialize_for_runtime_config")) &&
+        (hostfxr_initialize_for_dotnet_command_line = (hostfxr_initialize_for_dotnet_command_line_fn)::GetProcAddress(lib, "hostfxr_initialize_for_dotnet_command_line")) &&
         (hostfxr_get_runtime_delegate = (hostfxr_get_runtime_delegate_fn)::GetProcAddress(lib, "hostfxr_get_runtime_delegate")) &&
         (hostfxr_close = (hostfxr_close_fn)::GetProcAddress(lib, "hostfxr_close")) &&
         (hostfxr_set_error_writer = (hostfxr_set_error_writer_fn)::GetProcAddress(lib, "hostfxr_set_error_writer")))
@@ -199,7 +206,7 @@ struct error_writer
 thread_local std::wstringstream error_writer::_message;
 
 // Load and initialize .NET runtime and get assembly load function pointer
-void init_runtime(const wchar_t* host_path, const wchar_t* host_config)
+void init_runtime(const wchar_t* host_path, const wchar_t* host_config, bool is_self_contained)
 {
     struct hostfxr_context
     {
@@ -215,7 +222,21 @@ void init_runtime(const wchar_t* host_path, const wchar_t* host_config)
     hostfxr_context context;
 
     error_writer writer;
-    HRESULT hr = hostfxr_initialize_for_runtime_config(host_config, nullptr, &context._handle);
+    HRESULT hr{};
+
+    if (is_self_contained)
+    {
+        // Self-contained scenario support is experimental and relies upon the application scenario
+        // entry-point. The logic here is to trick the hosting API into initializing as an application
+        // but call the "load assembly and get delegate" instead of "run main". This has impact
+        // on the TPA make-up and hence assembly loading in general since the TPA populates the default ALC.
+        hr = hostfxr_initialize_for_dotnet_command_line(1, &host_path, nullptr, &context._handle);
+    }
+    else
+    {
+        hr = hostfxr_initialize_for_runtime_config(host_config, nullptr, &context._handle);
+    }
+
     if (hr == Success_HostAlreadyInitialized || hr == Success_DifferentRuntimeProperties)
     {
         hr = Success;
@@ -237,10 +258,8 @@ void init_runtime(const wchar_t* host_path, const wchar_t* host_config)
     }
 }
 
-std::wstring find_mapped_target_assembly(std::filesystem::path host_config, winrt::hstring class_id)
+std::optional<JsonObject> load_config_file(std::filesystem::path host_config)
 {
-    std::wstring target_assembly;
-
     try
     {
         auto config_file = StorageFile::GetFileFromPathAsync(host_config.c_str()).get();
@@ -248,14 +267,29 @@ std::wstring find_mapped_target_assembly(std::filesystem::path host_config, winr
         JsonObject root_object;
         if (JsonObject::TryParse(json_string, root_object))
         {
-            if (auto classes = root_object.TryLookup(L"activatableClasses"); classes)
+            return root_object;
+        }
+    }
+    catch (const winrt::hresult_error&)
+    {
+    }
+
+    return std::nullopt;
+}
+
+std::wstring find_mapped_target_assembly(JsonObject& host_config, winrt::hstring class_id)
+{
+    std::wstring target_assembly;
+
+    try
+    {
+        if (auto classes = host_config.TryLookup(L"activatableClasses"); classes)
+        {
+            if (auto value_type = classes.ValueType(); value_type == JsonValueType::Object)
             {
-                if (auto value_type = classes.ValueType(); value_type == JsonValueType::Object)
+                if (auto class_path = classes.GetObject().TryLookup(class_id); class_path)
                 {
-                    if (auto class_path = classes.GetObject().TryLookup(class_id); class_path)
-                    {
-                        target_assembly = class_path.GetString().c_str();
-                    }
+                    target_assembly = class_path.GetString().c_str();
                 }
             }
         }
@@ -265,6 +299,31 @@ std::wstring find_mapped_target_assembly(std::filesystem::path host_config, winr
     }
 
     return target_assembly;
+}
+
+bool is_self_contained_requested(JsonObject& host_config)
+{
+    if (auto runtime_options = host_config.TryLookup(L"runtimeOptions"); runtime_options)
+    {
+        if (runtime_options.ValueType() == JsonValueType::Object)
+        {
+            if (auto config_properties = runtime_options.GetObject().TryLookup(L"configProperties"); config_properties)
+            {
+                if (config_properties.ValueType() == JsonValueType::Object)
+                {
+                    if (auto is_self_contained = config_properties.GetObject().TryLookup(L"CSWINRT_SELF_CONTAINED"); is_self_contained)
+                    {
+                        if (is_self_contained.ValueType() == JsonValueType::Boolean)
+                        {
+                            return is_self_contained.GetBoolean();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return false;
 }
 
 std::filesystem::path probe_for_target_assembly(std::filesystem::path host_module, winrt::hstring class_id)
@@ -346,7 +405,7 @@ void GetActivationFactory(void* hstr_class_id, void** activation_factory)
     host_path.remove_filename();
 
     // Load HostFxr and get exported hosting functions
-    load_hostfxr();
+    load_hostfxr(host_module.wstring().c_str());
 
     // Determine host runtimeconfig.json from module name and load the runtime with it
     winrt::hstring class_id;
@@ -354,10 +413,18 @@ void GetActivationFactory(void* hstr_class_id, void** activation_factory)
     std::filesystem::path host_config = host_module;
     host_config.replace_extension(L".runtimeconfig.json");
     std::filesystem::path target_path;
+    bool is_self_contained = false;
     if (std::filesystem::exists(host_config))
     {
+        // Parse host config as JSON
+        auto host_config_json = load_config_file(host_config);
+        if (!host_config_json.has_value())
+        {
+            throw_hostfxr_hresult(InvalidConfigFile);
+        }
+        
         // If host runtimeconfig.json found, look for a target assembly mapping in it
-        auto target_assembly = find_mapped_target_assembly(host_config, class_id);
+        auto target_assembly = find_mapped_target_assembly(host_config_json.value(), class_id);
         if (!target_assembly.empty())
         {
             target_path = host_module;
@@ -367,6 +434,9 @@ void GetActivationFactory(void* hstr_class_id, void** activation_factory)
                 throw_hostfxr_hresult(InvalidConfigFile);
             }
         }
+
+        // Check if self contained .NET runtime is requested
+        is_self_contained = is_self_contained_requested(host_config_json.value());
     }
     else
     {
@@ -374,7 +444,7 @@ void GetActivationFactory(void* hstr_class_id, void** activation_factory)
         throw_hostfxr_hresult(InvalidConfigFile);
     }
 
-    init_runtime(host_module.wstring().c_str(), host_config.c_str());
+    init_runtime(host_module.wstring().c_str(), host_config.c_str(), is_self_contained);
 
     // If no explicit target assembly mapping found, probe for it by naming convention
     if (target_path.empty())

@@ -1,0 +1,11 @@
+{
+  "profiles": {
+    "WinUiBgTaskComponent (Package)": {
+      "commandName": "MsixPackage",
+      "nativeDebugging": true
+    },
+    "WinUiBgTaskComponent (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}
